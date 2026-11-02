@@ -1,5 +1,7 @@
 # buta-ppo
 
+Use a [TorchScript attention model](docs/attention.md).
+
 buta-ppo is a C++ reinforcement learning framework implementing Proximal Policy Optimization (PPO) for training Rocket League bots. Built using LibTorch and [RocketSim](https://crates.io/crates/rocketsim).
 
 My main goal with this framework was to make use seamless and speeds respectable. Comparing against my own experience with [GigaLearn](https://github.com/ZealanL/GigaLearnCPP-Leak) I can confidently say it's at least four times as fast. As for training stability and quality though I cannot say as this project is so new I have not extensively tested it though there are some bots which have surpassed nexto level utilizing this framework already.

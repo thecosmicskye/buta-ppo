@@ -4,6 +4,7 @@
 #include <ATen/autocast_mode.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -45,6 +46,20 @@ struct AutocastOffGuard {
 
     ~AutocastOffGuard() {
         at::autocast::set_autocast_enabled(torch::kCUDA, true);
+    }
+};
+
+struct SharedAutocastGuard {
+    bool enabled = at::autocast::is_autocast_enabled(torch::kCUDA);
+    c10::ScalarType dtype = at::autocast::get_autocast_dtype(torch::kCUDA);
+    SharedAutocastGuard() {
+        at::autocast::set_autocast_enabled(torch::kCUDA, true);
+        at::autocast::set_autocast_dtype(torch::kCUDA, torch::kBFloat16);
+    }
+    ~SharedAutocastGuard() {
+        at::autocast::set_autocast_enabled(torch::kCUDA, enabled);
+        at::autocast::set_autocast_dtype(torch::kCUDA, dtype);
+        at::autocast::clear_cache();
     }
 };
 
@@ -165,6 +180,19 @@ torch::nn::Sequential ActorCriticImpl::build_block(int64_t in_size, const std::v
 }
 
 ActorCriticImpl::ActorCriticImpl(const ActorCriticConfig& config) {
+    if (const char* path = std::getenv("BUTA_SHARED_MODEL")) {
+        scripted_.emplace(torch::jit::load(path));
+        size_t index = 0;
+        for (const auto& p : scripted_->named_parameters()) {
+            scripted_names_.push_back(p.name);
+            register_parameter("shared_param_" + std::to_string(index++), p.value);
+        }
+        index = 0;
+        for (const auto& b : scripted_->named_buffers()) {
+            register_buffer("shared_buffer_" + std::to_string(index++), b.value);
+        }
+        return;
+    }
     // Build shared layers.
     int64_t shared_out_size = config.obs_size;
     if (!config.shared_layers.empty()) {
@@ -206,6 +234,20 @@ ActorCriticImpl::ActorCriticImpl(const ActorCriticConfig& config) {
 
 std::vector<ParamInfo> ActorCriticImpl::parameter_layout() const {
     std::vector<ParamInfo> layout;
+    if (scripted_) {
+        size_t index = 0;
+        for (const auto& item : named_parameters()) {
+            const std::string& name = scripted_names_.at(index++);
+            const auto section = name.rfind("base.actor.", 0) == 0 ? ParamSection::Actor :
+                                 name.rfind("base.critic.", 0) == 0 ? ParamSection::Critic : ParamSection::Shared;
+            const bool hidden = (name.rfind("base.blocks.", 0) == 0 || name.rfind("base.readout.", 0) == 0) &&
+                                name.ends_with(".weight") && item.value().dim() == 2;
+            const auto kind = hidden ? ParamKind::HiddenWeight :
+                              item.value().dim() == 1 ? ParamKind::Vector : ParamKind::IOWeight;
+            layout.push_back({name, item.value(), section, kind});
+        }
+        return layout;
+    }
     for (const auto& item : named_parameters()) {
         const std::string& name = item.key();
         const std::string module = name.substr(0, name.find('.'));
@@ -235,6 +277,17 @@ std::vector<ParamInfo> ActorCriticImpl::parameter_layout() const {
 }
 
 void ActorCriticImpl::load_weights(const std::string& path) {
+    if (scripted_) {
+        auto loaded = torch::jit::load(path, parameters().front().device());
+        auto source = loaded.parameters();
+        auto target = scripted_->parameters();
+        torch::NoGradGuard no_grad;
+        auto s = source.begin();
+        for (auto t : target) {
+            t.copy_(*s++);
+        }
+        return;
+    }
     // Read straight onto the network's device, so a checkpoint saved on the GPU also loads on a CPU-only machine.
     const torch::Device device = parameters().front().device();
     torch::serialize::InputArchive archive;
@@ -259,6 +312,12 @@ void ActorCriticImpl::load_weights(const std::string& path) {
 }
 
 std::tuple<torch::Tensor, torch::Tensor> ActorCriticImpl::forward(torch::Tensor obs) {
+    if (scripted_) {
+        SharedAutocastGuard guard;
+        const auto output = scripted_->forward({obs}).toTuple();
+        return {output->elements()[0].toTensor().to(torch::kFloat32),
+                output->elements()[1].toTensor().to(torch::kFloat32).unsqueeze(-1)};
+    }
     torch::Tensor shared_features = obs;
     if (shared_mlp_) {
         shared_features = run_block(shared_mlp_, shared_features);
@@ -281,6 +340,7 @@ std::tuple<torch::Tensor, torch::Tensor> ActorCriticImpl::forward(torch::Tensor 
 }
 
 torch::Tensor ActorCriticImpl::forward_actor(torch::Tensor obs) {
+    if (scripted_) return std::get<0>(forward(obs));
     torch::Tensor shared_features = obs;
     if (shared_mlp_) {
         shared_features = run_block(shared_mlp_, shared_features);
@@ -292,6 +352,7 @@ torch::Tensor ActorCriticImpl::forward_actor(torch::Tensor obs) {
 }
 
 torch::Tensor ActorCriticImpl::forward_critic(torch::Tensor obs) {
+    if (scripted_) return std::get<1>(forward(obs));
     torch::Tensor shared_features = obs;
     if (shared_mlp_) {
         shared_features = run_block(shared_mlp_, shared_features);
@@ -355,6 +416,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ActorCriticImpl::evaluat
 }
 
 void save_model(const ActorCritic& model, const ModelConfig& config, const std::string& path) {
+    if (model->uses_scripted_model()) {
+        model->save_scripted(path);
+        return;
+    }
     // What `torch::save` writes, plus the config as a sub-archive.
     torch::serialize::OutputArchive archive;
     model->save(archive);
@@ -432,4 +497,4 @@ std::string describe_model_config(const ModelConfig& config) {
            ", ticks_per_step " + std::to_string(config.ticks_per_step);
 }
 
-} // namespace buta_ppo::rl 
+} // namespace buta_ppo::rl

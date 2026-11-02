@@ -239,7 +239,7 @@ int64_t PPORunner::load_latest_checkpoint(const std::string& dir) {
     const ModelConfig current = model_config();
 
     // Checkpoints saved before models stored their config only get the weight check below.
-    const std::optional<ModelConfig> saved = read_model_config(model_path);
+    const std::optional<ModelConfig> saved = actor_critic_->uses_scripted_model() ? std::nullopt : read_model_config(model_path);
     if (saved && (saved->network != current.network || saved->max_players_per_team != current.max_players_per_team)) {
         throw std::runtime_error("Could not resume from the latest checkpoint, " + model_path + ". It was trained with\n  " +
                                  describe_model_config(*saved) + "\nbut the config gives\n  " +

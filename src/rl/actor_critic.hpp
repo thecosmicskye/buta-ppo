@@ -2,6 +2,7 @@
 #pragma once
 
 #include <torch/torch.h>
+#include <torch/script.h>
 #include <vector>
 #include <cstdint>
 #include <optional>
@@ -71,6 +72,8 @@ struct ParamInfo {
  */
 class ActorCriticImpl : public torch::nn::Module {
 private:
+    std::optional<torch::jit::Module> scripted_;
+    std::vector<std::string> scripted_names_;
     // Shared initial layers.
     torch::nn::Sequential shared_mlp_{nullptr};
 
@@ -90,6 +93,9 @@ private:
 
 public:
     explicit ActorCriticImpl(const ActorCriticConfig& config);
+
+    bool uses_scripted_model() const { return scripted_.has_value(); }
+    void save_scripted(const std::string& path) const { scripted_->save(path); }
 
     /**
      * @brief Classifies every parameter by network section and role.
@@ -208,4 +214,4 @@ void save_model(const ActorCritic& model, const ModelConfig& config, const std::
  */
 [[nodiscard]] std::string describe_model_config(const ModelConfig& config);
 
-} // namespace buta_ppo::rl 
+} // namespace buta_ppo::rl
